@@ -8,7 +8,8 @@
 module Stream (
     Stream(..), yield, liftIO,
     collect, fromList,
-    Stream.map, Stream.mapM, Stream.mapAccumL
+    Stream.map, Stream.mapM, Stream.mapAccumL,
+    Stream.foldM
   ) where
 
 import Control.Monad
@@ -102,3 +103,16 @@ mapAccumL f c str = Stream $ do
     Right (a, str') -> do
       (c',b) <- f c a
       return (Right (b, mapAccumL f c' str'))
+
+foldM :: Monad m => (s -> Either b a -> m s) -> s -> Stream m a b -> m s
+foldM f s0 str' = go s0 str'
+ where
+  go s str = do
+   res <- runStream str
+   case res of
+     Left e -> f s (Left e)
+     Right (v,str') -> do
+      s' <- f s (Right v)
+      go s' str'
+
+-- Stream a b = Stream { runStream :: (Either b (a, Stream m a b)) }

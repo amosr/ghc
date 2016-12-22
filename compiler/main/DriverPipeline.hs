@@ -697,15 +697,6 @@ pipeLoop phase input_fn = do
                                   (text "Running phase" <+> ppr phase)
            (next_phase, output_fn) <- runHookedPhase phase input_fn dflags
            r <- pipeLoop next_phase output_fn
-           case phase of
-               HscOut {} ->
-                   whenGeneratingDynamicToo dflags $ do
-                       setDynFlags $ dynamicTooMkDynamicDynFlags dflags
-                       -- TODO shouldn't ignore result:
-                       _ <- pipeLoop phase input_fn
-                       return ()
-               _ ->
-                   return ()
            return r
 
 runHookedPhase :: PhasePlus -> FilePath -> DynFlags
@@ -723,11 +714,21 @@ runHookedPhase pp input dflags =
 -- (which specifies all of the ambient information.)
 phaseOutputFilename :: Phase{-next phase-} -> CompPipeline FilePath
 phaseOutputFilename next_phase = do
-  PipeEnv{stop_phase, src_basename, output_spec} <- getPipeEnv
-  PipeState{maybe_loc, hsc_env} <- getPipeState
+  PipeState{hsc_env} <- getPipeState
   let dflags = hsc_dflags hsc_env
+  phaseOutputFilenameWithDynFlags dflags next_phase
+
+-- | Computes the next output filename after we run @next_phase@.
+-- Takes dynamic flags explicitly rather than from environment.
+phaseOutputFilenameWithDynFlags :: DynFlags -> Phase{-next phase-} -> CompPipeline FilePath
+phaseOutputFilenameWithDynFlags dflags next_phase = do
+  PipeEnv{stop_phase, src_basename, output_spec} <- getPipeEnv
+  PipeState{maybe_loc} <- getPipeState
+  liftIO $ debugTraceMsg dflags 4 (text "phaseOutputFilename: src_basename " <+> text src_basename)
+  liftIO $ debugTraceMsg dflags 4 (text "phaseOutputFilename: output_spec " <+> ppr maybe_loc)
   liftIO $ getOutputFilename stop_phase output_spec
                              src_basename dflags next_phase maybe_loc
+
 
 -- | Computes the next output filename for something in the compilation
 -- pipeline.  This is controlled by several variables:
@@ -1044,13 +1045,39 @@ runPhase (HscOut src_flavour mod_name result) _ dflags = do
 
                     PipeState{hsc_env=hsc_env'} <- getPipeState
 
-                    (outputFilename, mStub) <- liftIO $ hscGenHardCode hsc_env' cgguts mod_summary output_fn
+                    dyn_out <- ifGeneratingDynamicToo dflags
+                                  (Just <$> phaseOutputFilenameWithDynFlags (dynamicTooMkDynamicDynFlags dflags) next_phase)
+                                  (return Nothing)
+                    liftIO $ debugTraceMsg dflags 4 (text "Running: putting dyn_out=" <+> ppr dyn_out)
+
+
+                    (outputFilename, mStub) <- liftIO $ hscGenHardCode hsc_env' cgguts mod_summary output_fn dyn_out
                     case mStub of
                         Nothing -> return ()
                         Just stub_c ->
                             do stub_o <- liftIO $ compileStub hsc_env' stub_c
                                setStubO stub_o
 
+                    case dyn_out of
+                      Just dyn_out'
+                       -> do  setDynFlags $ dynamicTooMkDynamicDynFlags dflags
+                              location <- getLocation src_flavour mod_name
+                              setModLocation location
+                              -- TODO shouldn't ignore result:
+                              liftIO $ debugTraceMsg dflags 4 (text "running dynamic output with dyn_out'=" <+> text dyn_out')
+                              dflags'' <- getDynFlags
+                              liftIO $ debugTraceMsg dflags 4 (text "options are dynObjectSuf " <+> text (dynObjectSuf dflags''))
+                              liftIO $ debugTraceMsg dflags 4 (text "options are objectSuf " <+> text (objectSuf dflags''))
+                              _ <- pipeLoop (RealPhase next_phase) dyn_out'
+                              liftIO $ debugTraceMsg dflags 4 (text "finished running dynamic output")
+                              setDynFlags dflags
+                              return ()
+                      _ -> return ()
+
+                    location <- getLocation src_flavour mod_name
+                    setModLocation location
+                    liftIO $ debugTraceMsg dflags 4 (text "returning from HscRecomp with outputFilename=" <+> text outputFilename)
+                    liftIO $ debugTraceMsg dflags 4 (text "returning from HscRecomp with output_fn=" <+> text output_fn)
                     return (RealPhase next_phase, outputFilename)
 
 -----------------------------------------------------------------------------
@@ -1260,6 +1287,13 @@ runPhase (RealPhase (As with_cpp)) input_fn dflags
 
         next_phase <- maybeMergeStub
         output_fn <- phaseOutputFilename next_phase
+        dflags'' <- getDynFlags
+        liftIO $ debugTraceMsg dflags 4 (text "asm: options are dynObjectSuf " <+> text (dynObjectSuf dflags))
+        liftIO $ debugTraceMsg dflags 4 (text "asm: options are objectSuf " <+> text (objectSuf dflags))
+        liftIO $ debugTraceMsg dflags 4 (text "asm: options'' are dynObjectSuf " <+> text (dynObjectSuf dflags''))
+        liftIO $ debugTraceMsg dflags 4 (text "asm: options'' are objectSuf " <+> text (objectSuf dflags''))
+        liftIO $ debugTraceMsg dflags 4 (text "asm: next_phase = " <+> ppr next_phase)
+        liftIO $ debugTraceMsg dflags 4 (text "Running the assembler to output" <+> text output_fn)
 
         -- we create directories for the object file, because it
         -- might be a hierarchical module.

@@ -48,6 +48,7 @@ import System.IO
 codeOutput :: DynFlags
            -> Module
            -> FilePath
+           -> Maybe FilePath
            -> ModLocation
            -> ForeignStubs
            -> [InstalledUnitId]
@@ -55,7 +56,7 @@ codeOutput :: DynFlags
            -> IO (FilePath,
                   (Bool{-stub_h_exists-}, Maybe FilePath{-stub_c_exists-}))
 
-codeOutput dflags this_mod filenm location foreign_stubs pkg_deps cmm_stream
+codeOutput dflags this_mod filenm dyn_filenm location foreign_stubs pkg_deps cmm_stream
   =
     do  {
         -- Lint each CmmGroup as it goes past
@@ -83,7 +84,7 @@ codeOutput dflags this_mod filenm location foreign_stubs pkg_deps cmm_stream
 
         ; stubs_exist <- outputForeignStubs dflags this_mod location foreign_stubs
         ; case hscTarget dflags of {
-             HscAsm         -> outputAsm dflags this_mod location filenm
+             HscAsm         -> outputAsm dflags this_mod location filenm dyn_filenm
                                          linted_cmm_stream;
              HscC           -> outputC dflags filenm linted_cmm_stream pkg_deps;
              HscLlvm        -> outputLlvm dflags filenm linted_cmm_stream;
@@ -95,6 +96,10 @@ codeOutput dflags this_mod filenm location foreign_stubs pkg_deps cmm_stream
 
 doOutput :: String -> (Handle -> IO a) -> IO a
 doOutput filenm io_action = bracket (openFile filenm WriteMode) hClose io_action
+
+doOutputMaybe :: Maybe String -> (Maybe Handle -> IO a) -> IO a
+doOutputMaybe Nothing io_action = io_action Nothing
+doOutputMaybe (Just filenm) io_action = bracket (openFile filenm WriteMode) hClose (io_action . Just)
 
 {-
 ************************************************************************
@@ -146,18 +151,19 @@ outputC dflags filenm cmm_stream packages
 ************************************************************************
 -}
 
-outputAsm :: DynFlags -> Module -> ModLocation -> FilePath
+outputAsm :: DynFlags -> Module -> ModLocation -> FilePath -> Maybe FilePath
           -> Stream IO RawCmmGroup ()
           -> IO ()
-outputAsm dflags this_mod location filenm cmm_stream
+outputAsm dflags this_mod location filenm dyn_filenm cmm_stream
  | cGhcWithNativeCodeGen == "YES"
   = do ncg_uniqs <- mkSplitUniqSupply 'n'
 
        debugTraceMsg dflags 4 (text "Outputing asm to" <+> text filenm)
 
        _ <- {-# SCC "OutputAsm" #-} doOutput filenm $
-           \h -> {-# SCC "NativeCodeGen" #-}
-                 nativeCodeGen dflags this_mod location h ncg_uniqs cmm_stream
+           \h -> doOutputMaybe dyn_filenm $
+           \h2 -> {-# SCC "NativeCodeGen" #-}
+                 nativeCodeGen dflags this_mod location h h2 ncg_uniqs cmm_stream
        return ()
 
  | otherwise

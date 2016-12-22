@@ -166,14 +166,14 @@ data NcgImpl statics instr jumpDest = NcgImpl {
     }
 
 --------------------
-nativeCodeGen :: DynFlags -> Module -> ModLocation -> Handle -> UniqSupply
+nativeCodeGen :: DynFlags -> Module -> ModLocation -> Handle -> Maybe Handle -> UniqSupply
               -> Stream IO RawCmmGroup ()
               -> IO UniqSupply
-nativeCodeGen dflags this_mod modLoc h us cmms
+nativeCodeGen dflags this_mod modLoc hOut hDyn us cmms
  = let platform = targetPlatform dflags
        nCG' :: (Outputable statics, Outputable instr, Instruction instr)
             => NcgImpl statics instr jumpDest -> IO UniqSupply
-       nCG' ncgImpl = nativeCodeGen' dflags this_mod modLoc ncgImpl h us cmms
+       nCG' ncgImpl = nativeCodeGen' dflags this_mod modLoc ncgImpl hOut hDyn us cmms
    in case platformArch platform of
       ArchX86       -> nCG' (x86NcgImpl    dflags)
       ArchX86_64    -> nCG' (x86_64NcgImpl dflags)
@@ -286,19 +286,19 @@ nativeCodeGen' :: (Outputable statics, Outputable instr, Instruction instr)
                -> Module -> ModLocation
                -> NcgImpl statics instr jumpDest
                -> Handle
+               -> Maybe Handle
                -> UniqSupply
                -> Stream IO RawCmmGroup ()
                -> IO UniqSupply
-nativeCodeGen' dflags this_mod modLoc ncgImpl h us cmms
+nativeCodeGen' dflags this_mod modLoc ncgImpl h hdyn us cmms
  = do
         -- BufHandle is a performance hack.  We could hide it inside
         -- Pretty if it weren't for the fact that we do lots of little
         -- printDocs here (in order to do codegen in constant space).
-        bufh <- newBufHandle h
+        bufh    <- newBufHandle h
+        bufhdyn <- mapM newBufHandle hdyn
         let ngs0 = NGS [] [] [] [] [] [] emptyUFM
-        (ngs, us') <- cmmNativeGenStream dflags this_mod modLoc ncgImpl bufh us
-                                         cmms ngs0
-        finishNativeGen dflags modLoc bufh us' ngs
+        cmmNativeGenStream dflags this_mod modLoc ncgImpl bufh bufhdyn ngs0 us cmms
 
 finishNativeGen :: Instruction instr
                 => DynFlags
@@ -358,61 +358,86 @@ cmmNativeGenStream :: (Outputable statics, Outputable instr, Instruction instr)
               -> Module -> ModLocation
               -> NcgImpl statics instr jumpDest
               -> BufHandle
+              -> Maybe BufHandle
+              -> NativeGenAcc statics instr
               -> UniqSupply
               -> Stream IO RawCmmGroup ()
-              -> NativeGenAcc statics instr
+              -> IO UniqSupply
+
+cmmNativeGenStream dflags this_mod modLoc ncgImpl h hdyn ngs0 us0 cmms
+ = do (ngs,ngs_dyn,us) <- Stream.foldM go (ngs0,ngs0,us0) cmms
+      us' <- finishNativeGen dflags modLoc h us ngs
+      case hdyn of
+       Nothing
+        -> return us'
+       Just hdyn'
+        -> finishNativeGen dflags_dyn modLoc hdyn' us' ngs_dyn
+ where
+  go (ngs, ngs_dyn, us) r = do
+    (ngs',us') <- cmmNativeGenFold dflags this_mod modLoc ncgImpl h (ngs,us) r
+    case hdyn of
+     Nothing -> return (ngs',ngs',us')
+     Just hdyn' -> do
+      (ngs_dyn',us'') <- cmmNativeGenFold dflags_dyn this_mod modLoc ncgImpl hdyn' (ngs_dyn,us') r
+      return (ngs',ngs_dyn',us'')
+
+  dflags_dyn = dynamicTooMkDynamicDynFlags dflags
+
+
+cmmNativeGenFold :: (Outputable statics, Outputable instr, Instruction instr)
+              => DynFlags
+              -> Module -> ModLocation
+              -> NcgImpl statics instr jumpDest
+              -> BufHandle
+              -> (NativeGenAcc statics instr, UniqSupply)
+              -> Either () RawCmmGroup
               -> IO (NativeGenAcc statics instr, UniqSupply)
 
-cmmNativeGenStream dflags this_mod modLoc ncgImpl h us cmm_stream ngs
- = do r <- Stream.runStream cmm_stream
-      case r of
-        Left () ->
-          return (ngs { ngs_imports = reverse $ ngs_imports ngs
-                      , ngs_natives = reverse $ ngs_natives ngs
-                      , ngs_colorStats = reverse $ ngs_colorStats ngs
-                      , ngs_linearStats = reverse $ ngs_linearStats ngs
-                      },
-                  us)
-        Right (cmms, cmm_stream') -> do
+cmmNativeGenFold dflags this_mod modLoc ncgImpl h (ngs, us) r
+ = case r of
+     Left () ->
+       return (ngs { ngs_imports = reverse $ ngs_imports ngs
+                   , ngs_natives = reverse $ ngs_natives ngs
+                   , ngs_colorStats = reverse $ ngs_colorStats ngs
+                   , ngs_linearStats = reverse $ ngs_linearStats ngs
+                   },
+               us)
+     Right cmms -> do
 
-          -- Generate debug information
-          let debugFlag = debugLevel dflags > 0
-              !ndbgs | debugFlag = cmmDebugGen modLoc cmms
-                     | otherwise = []
-              dbgMap = debugToMap ndbgs
+       -- Generate debug information
+       let debugFlag = debugLevel dflags > 0
+           !ndbgs | debugFlag = cmmDebugGen modLoc cmms
+                  | otherwise = []
+           dbgMap = debugToMap ndbgs
 
-          -- Insert split marker, generate native code
-          let splitObjs = gopt Opt_SplitObjs dflags
-              split_marker = CmmProc mapEmpty mkSplitMarkerLabel [] $
-                             ofBlockList (panic "split_marker_entry") []
-              cmms' | splitObjs  = split_marker : cmms
-                    | otherwise  = cmms
-          (ngs',us') <- cmmNativeGens dflags this_mod modLoc ncgImpl h dbgMap us
-                                      cmms' ngs 0
+       -- Insert split marker, generate native code
+       let splitObjs = gopt Opt_SplitObjs dflags
+           split_marker = CmmProc mapEmpty mkSplitMarkerLabel [] $
+                          ofBlockList (panic "split_marker_entry") []
+           cmms' | splitObjs  = split_marker : cmms
+                 | otherwise  = cmms
+       (ngs',us') <- cmmNativeGens dflags this_mod modLoc ncgImpl h dbgMap us
+                                   cmms' ngs 0
 
-          -- Link native code information into debug blocks
-          let !ldbgs = cmmDebugLink (ngs_labels ngs') ndbgs
-          dumpIfSet_dyn dflags Opt_D_dump_debug "Debug Infos"
-            (vcat $ map ppr ldbgs)
+       -- Link native code information into debug blocks
+       let !ldbgs = cmmDebugLink (ngs_labels ngs') ndbgs
+       dumpIfSet_dyn dflags Opt_D_dump_debug "Debug Infos"
+         (vcat $ map ppr ldbgs)
 
-          -- Emit & clear DWARF information when generating split
-          -- object files, as we need it to land in the same object file
-          -- When using split sections, note that we do not split the debug
-          -- info but emit all the info at once in finishNativeGen.
-          (ngs'', us'') <-
-            if debugFlag && splitObjs
-            then do (dwarf, us'') <- dwarfGen dflags modLoc us ldbgs
-                    emitNativeCode dflags h dwarf
-                    return (ngs' { ngs_debug = []
-                                 , ngs_dwarfFiles = emptyUFM
-                                 , ngs_labels = [] },
-                            us'')
-            else return (ngs' { ngs_debug  = ngs_debug ngs' ++ ldbgs
-                              , ngs_labels = [] },
-                         us')
-
-          cmmNativeGenStream dflags this_mod modLoc ncgImpl h us''
-              cmm_stream' ngs''
+       -- Emit & clear DWARF information when generating split
+       -- object files, as we need it to land in the same object file
+       -- When using split sections, note that we do not split the debug
+       -- info but emit all the info at once in finishNativeGen.
+       if debugFlag && splitObjs
+       then do (dwarf, us'') <- dwarfGen dflags modLoc us ldbgs
+               emitNativeCode dflags h dwarf
+               return (ngs' { ngs_debug = []
+                            , ngs_dwarfFiles = emptyUFM
+                            , ngs_labels = [] },
+                       us'')
+       else return (ngs' { ngs_debug  = ngs_debug ngs' ++ ldbgs
+                         , ngs_labels = [] },
+                    us')
 
 -- | Do native code generation on all these cmms.
 --
