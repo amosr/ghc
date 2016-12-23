@@ -47,15 +47,14 @@ import System.IO
 
 codeOutput :: DynFlags
            -> Module
-           -> FilePath
+           -> [(DynFlags,FilePath)]
            -> ModLocation
            -> ForeignStubs
            -> [InstalledUnitId]
            -> Stream IO RawCmmGroup ()                       -- Compiled C--
-           -> IO (FilePath,
-                  (Bool{-stub_h_exists-}, Maybe FilePath{-stub_c_exists-}))
+           -> IO (Bool{-stub_h_exists-}, Maybe FilePath{-stub_c_exists-})
 
-codeOutput dflags this_mod filenm location foreign_stubs pkg_deps cmm_stream
+codeOutput dflags this_mod outputs location foreign_stubs pkg_deps cmm_stream
   =
     do  {
         -- Lint each CmmGroup as it goes past
@@ -83,18 +82,29 @@ codeOutput dflags this_mod filenm location foreign_stubs pkg_deps cmm_stream
 
         ; stubs_exist <- outputForeignStubs dflags this_mod location foreign_stubs
         ; case hscTarget dflags of {
-             HscAsm         -> outputAsm dflags this_mod location filenm
+             HscAsm         -> outputAsm dflags this_mod location outputs
                                          linted_cmm_stream;
-             HscC           -> outputC dflags filenm linted_cmm_stream pkg_deps;
-             HscLlvm        -> outputLlvm dflags filenm linted_cmm_stream;
+             -- AMOS TODO OUTPUT
+             HscC           -> flip mapM_ outputs $ \(dflags',filenm) ->
+                               outputC dflags' filenm linted_cmm_stream pkg_deps;
+             HscLlvm        -> flip mapM_ outputs $ \(dflags',filenm) ->
+                               outputLlvm dflags' filenm linted_cmm_stream;
              HscInterpreted -> panic "codeOutput: HscInterpreted";
              HscNothing     -> panic "codeOutput: HscNothing"
           }
-        ; return (filenm, stubs_exist)
+        ; return stubs_exist
         }
 
 doOutput :: String -> (Handle -> IO a) -> IO a
 doOutput filenm io_action = bracket (openFile filenm WriteMode) hClose io_action
+
+doOutputs :: [(a,FilePath)] -> ([(a,Handle)] -> IO b) -> IO b
+doOutputs outputs io_action = go outputs []
+ where
+  go [] handles = io_action $ reverse handles
+  go ((info,filenm):rest) handles = do
+    bracket (openFile filenm WriteMode) hClose $ \handle ->
+      go rest ((info,handle) : handles)
 
 {-
 ************************************************************************
@@ -146,18 +156,19 @@ outputC dflags filenm cmm_stream packages
 ************************************************************************
 -}
 
-outputAsm :: DynFlags -> Module -> ModLocation -> FilePath
+outputAsm :: DynFlags -> Module -> ModLocation -> [(DynFlags,FilePath)]
           -> Stream IO RawCmmGroup ()
           -> IO ()
-outputAsm dflags this_mod location filenm cmm_stream
+outputAsm dflags this_mod location outputs cmm_stream
  | cGhcWithNativeCodeGen == "YES"
   = do ncg_uniqs <- mkSplitUniqSupply 'n'
 
-       debugTraceMsg dflags 4 (text "Outputing asm to" <+> text filenm)
+       flip mapM_ outputs $ \(_,filenm) -> 
+          debugTraceMsg dflags 4 (text "Outputing asm to" <+> text filenm)
 
-       _ <- {-# SCC "OutputAsm" #-} doOutput filenm $
-           \h -> {-# SCC "NativeCodeGen" #-}
-                 nativeCodeGen dflags this_mod location h ncg_uniqs cmm_stream
+       _ <- {-# SCC "OutputAsm" #-} doOutputs outputs $ \hs ->
+            {-# SCC "NativeCodeGen" #-}
+            nativeCodeGen dflags this_mod location hs ncg_uniqs cmm_stream
        return ()
 
  | otherwise
