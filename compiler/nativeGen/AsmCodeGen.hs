@@ -166,14 +166,14 @@ data NcgImpl statics instr jumpDest = NcgImpl {
     }
 
 --------------------
-nativeCodeGen :: DynFlags -> Module -> ModLocation -> Handle -> Maybe Handle -> UniqSupply
+nativeCodeGen :: DynFlags -> Module -> ModLocation -> [(DynFlags,Handle)] -> UniqSupply
               -> Stream IO RawCmmGroup ()
               -> IO UniqSupply
-nativeCodeGen dflags this_mod modLoc hOut hDyn us cmms
+nativeCodeGen dflags this_mod modLoc hOuts us cmms
  = let platform = targetPlatform dflags
        nCG' :: (Outputable statics, Outputable instr, Instruction instr)
             => NcgImpl statics instr jumpDest -> IO UniqSupply
-       nCG' ncgImpl = nativeCodeGen' dflags this_mod modLoc ncgImpl hOut hDyn us cmms
+       nCG' ncgImpl = nativeCodeGen' dflags this_mod modLoc ncgImpl hOuts us cmms
    in case platformArch platform of
       ArchX86       -> nCG' (x86NcgImpl    dflags)
       ArchX86_64    -> nCG' (x86_64NcgImpl dflags)
@@ -293,20 +293,19 @@ nativeCodeGen' :: (Outputable statics, Outputable instr, Instruction instr)
                => DynFlags
                -> Module -> ModLocation
                -> NcgImpl statics instr jumpDest
-               -> Handle
-               -> Maybe Handle
+               -> [(DynFlags,Handle)]
                -> UniqSupply
                -> Stream IO RawCmmGroup ()
                -> IO UniqSupply
-nativeCodeGen' dflags this_mod modLoc ncgImpl h hdyn us cmms
+nativeCodeGen' dflags this_mod modLoc ncgImpl hOuts us cmms
  = do
         -- BufHandle is a performance hack.  We could hide it inside
         -- Pretty if it weren't for the fact that we do lots of little
         -- printDocs here (in order to do codegen in constant space).
-        bufh    <- newBufHandle h
-        bufhdyn <- mapM newBufHandle hdyn
+        let secondM f = mapM (\(x,y) -> (,) x <$> f y)
+        bufhs   <- secondM newBufHandle hOuts
         let ngs0 = NGS [] [] []
-        cmmNativeGenStream dflags this_mod modLoc ncgImpl bufh bufhdyn ngs0 us cmms
+        cmmNativeGenStream dflags this_mod modLoc ncgImpl bufhs ngs0 us cmms
 
 finishNativeGenStats :: Instruction instr
                 => DynFlags
@@ -369,35 +368,29 @@ cmmNativeGenStream :: (Outputable statics, Outputable instr, Instruction instr)
               => DynFlags
               -> Module -> ModLocation
               -> NcgImpl statics instr jumpDest
-              -> BufHandle
-              -> Maybe BufHandle
+              -> [(DynFlags,BufHandle)]
               -> NativeGenAccStatistics statics instr
               -> UniqSupply
               -> Stream IO RawCmmGroup ()
               -> IO UniqSupply
 
-cmmNativeGenStream dflags this_mod modLoc ncgImpl h hdyn ngstats0 us0 cmms
- = do let ng_out0 = NativeGenAccPerOutput [] [] [] emptyUFM
-      (ngstats, ng_out,ng_dyn, us) <- Stream.foldM go (ngstats0,ng_out0,ng_out0,us0) cmms
+cmmNativeGenStream dflags this_mod modLoc ncgImpl hs ngstats0 us0 cmms
+ = do let ng_outs0 = map (\_ -> NativeGenAccPerOutput [] [] [] emptyUFM) hs
+      (ngstats, ng_outs, us) <- Stream.foldM go (ngstats0,ng_outs0,us0) cmms
 
       finishNativeGenStats dflags ngstats
 
-      us' <- finishNativeGenOut dflags modLoc h us ng_out
-      case hdyn of
-       Nothing
-        -> return us'
-       Just hdyn'
-        -> finishNativeGenOut dflags_dyn modLoc hdyn' us' ng_dyn
+      let finish us' ((dflags',h'),ng_out) = finishNativeGenOut dflags' modLoc h' us' ng_out
+      foldM finish us (hs `zip` ng_outs)
  where
-  go (ngstats, ng_out, ng_dyn, us) r = do
-    (ngstats',ng_out',us') <- cmmNativeGenFold dflags this_mod modLoc ncgImpl h ngstats ng_out us r
-    case hdyn of
-     Nothing -> return (ngstats',ng_out',ng_out',us')
-     Just hdyn' -> do
-      (_,ng_dyn',us'') <- cmmNativeGenFold dflags_dyn this_mod modLoc ncgImpl hdyn' ngstats' ng_dyn us' r
-      return (ngstats',ng_out',ng_dyn',us'')
-
-  dflags_dyn = dynamicTooMkDynamicDynFlags dflags
+  go (ngstats, ng_outs, us) r = goFold ngstats us r (hs `zip` ng_outs)
+  goFold ngstats us _ [] =
+    return (ngstats, [], us)
+  goFold ngstats us r (((dflags',h),ng_out):ng_outs) = do
+    (ngstats',ng_out',us') <- cmmNativeGenFold dflags' this_mod modLoc ncgImpl h ngstats ng_out us r
+    -- Ignore statistics from later outputs
+    (_,ng_outs',us'') <- goFold ngstats us' r ng_outs
+    return (ngstats', ng_out' : ng_outs', us'')
 
 
 cmmNativeGenFold :: (Outputable statics, Outputable instr, Instruction instr)

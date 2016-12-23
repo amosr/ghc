@@ -1238,9 +1238,9 @@ hscWriteIface dflags iface no_change mod_summary = do
         writeIfaceFile dynDflags dynIfaceFile' iface
 
 -- | Compile to hard-code.
-hscGenHardCode :: HscEnv -> CgGuts -> ModSummary -> FilePath -> Maybe FilePath
-               -> IO (FilePath, Maybe FilePath) -- ^ @Just f@ <=> _stub.c is f
-hscGenHardCode hsc_env cgguts mod_summary output_filename output_dyn_filename = do
+hscGenHardCode :: HscEnv -> CgGuts -> ModSummary -> [(DynFlags,FilePath)]
+               -> IO (Maybe FilePath) -- ^ @Just f@ <=> _stub.c is f
+hscGenHardCode hsc_env cgguts mod_summary outputs = do
         let CgGuts{ -- This is the last use of the ModGuts in a compilation.
                     -- From now on, we just use the bits we need.
                     cg_module   = this_mod,
@@ -1293,11 +1293,11 @@ hscGenHardCode hsc_env cgguts mod_summary output_filename output_dyn_filename = 
                             return a
                 rawcmms1 = Stream.mapM dump rawcmms0
 
-            (output_filename, (_stub_h_exists, stub_c_exists))
+            (_stub_h_exists, stub_c_exists)
                 <- {-# SCC "codeOutput" #-}
-                  codeOutput dflags this_mod output_filename output_dyn_filename location
+                  codeOutput dflags this_mod outputs location
                   foreign_stubs dependencies rawcmms1
-            return (output_filename, stub_c_exists)
+            return stub_c_exists
 
 
 hscInteractive :: HscEnv
@@ -1347,7 +1347,7 @@ hscCompileCmmFile hsc_env filename output_filename = runHsc hsc_env $ do
             -- lest we reproduce #11784.
             mod_name = mkModuleName $ "Cmm$" ++ FilePath.takeFileName filename
             cmm_mod = mkModule (thisPackage dflags) mod_name
-        _ <- codeOutput dflags cmm_mod output_filename Nothing no_loc NoStubs [] rawCmms
+        _ <- codeOutput dflags cmm_mod [(dflags,output_filename)] no_loc NoStubs [] rawCmms
         return ()
   where
     no_loc = ModLocation{ ml_hs_file  = Just filename,

@@ -1045,40 +1045,32 @@ runPhase (HscOut src_flavour mod_name result) _ dflags = do
 
                     PipeState{hsc_env=hsc_env'} <- getPipeState
 
+                    let dynflags = dynamicTooMkDynamicDynFlags dflags
+                    dyn_fn <- phaseOutputFilenameWithDynFlags dynflags next_phase
+
                     dyn_out <- ifGeneratingDynamicToo dflags
-                                  (Just <$> phaseOutputFilenameWithDynFlags (dynamicTooMkDynamicDynFlags dflags) next_phase)
-                                  (return Nothing)
-                    liftIO $ debugTraceMsg dflags 4 (text "Running: putting dyn_out=" <+> ppr dyn_out)
+                                  (return [(dynflags, dyn_fn)])
+                                  (return [])
 
-
-                    (outputFilename, mStub) <- liftIO $ hscGenHardCode hsc_env' cgguts mod_summary output_fn dyn_out
+                    let outputs = (dflags, output_fn) : dyn_out
+                    mStub <- liftIO $ hscGenHardCode hsc_env' cgguts mod_summary outputs
                     case mStub of
                         Nothing -> return ()
                         Just stub_c ->
                             do stub_o <- liftIO $ compileStub hsc_env' stub_c
                                setStubO stub_o
 
-                    case dyn_out of
-                      Just dyn_out'
-                       -> do  setDynFlags $ dynamicTooMkDynamicDynFlags dflags
+                    forM_ dyn_out $ \(dynflags, dyn_out') -> do
+                              setDynFlags dynflags
                               location <- getLocation src_flavour mod_name
                               setModLocation location
                               -- TODO shouldn't ignore result:
-                              liftIO $ debugTraceMsg dflags 4 (text "running dynamic output with dyn_out'=" <+> text dyn_out')
-                              dflags'' <- getDynFlags
-                              liftIO $ debugTraceMsg dflags 4 (text "options are dynObjectSuf " <+> text (dynObjectSuf dflags''))
-                              liftIO $ debugTraceMsg dflags 4 (text "options are objectSuf " <+> text (objectSuf dflags''))
                               _ <- pipeLoop (RealPhase next_phase) dyn_out'
-                              liftIO $ debugTraceMsg dflags 4 (text "finished running dynamic output")
                               setDynFlags dflags
-                              return ()
-                      _ -> return ()
+                              location <- getLocation src_flavour mod_name
+                              setModLocation location
 
-                    location <- getLocation src_flavour mod_name
-                    setModLocation location
-                    liftIO $ debugTraceMsg dflags 4 (text "returning from HscRecomp with outputFilename=" <+> text outputFilename)
-                    liftIO $ debugTraceMsg dflags 4 (text "returning from HscRecomp with output_fn=" <+> text output_fn)
-                    return (RealPhase next_phase, outputFilename)
+                    return (RealPhase next_phase, output_fn)
 
 -----------------------------------------------------------------------------
 -- Cmm phase
